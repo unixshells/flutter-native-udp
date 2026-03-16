@@ -36,14 +36,8 @@ public class NativeUdpPlugin: NSObject, FlutterPlugin {
 
     let socket = UdpSocket(id: id, port: UInt16(port), channel: channel!)
     sockets[id] = socket
-
-    socket.bind { localPort in
-      if let localPort = localPort {
-        result(["port": localPort])
-      } else {
-        result(FlutterError(code: "BIND_FAILED", message: "Failed to bind UDP socket", details: nil))
-      }
-    }
+    // Return immediately — local port is assigned when the connection starts.
+    result(["port": port])
   }
 
   private func handleSend(args: [String: Any], result: @escaping FlutterResult) {
@@ -70,18 +64,18 @@ public class NativeUdpPlugin: NSObject, FlutterPlugin {
   }
 }
 
-/// UDP socket backed by Network.framework NWListener + NWConnection.
-/// Uses NWListener to receive datagrams and NWConnection to send.
-/// Properly handles iOS cellular network interface selection.
+/// UDP socket backed by a single NWConnection for both send and receive.
+/// Uses NWConnection as a bidirectional UDP flow — the correct pattern for
+/// a UDP client on iOS. Works on both WiFi and cellular without needing
+/// to specify interface types.
 private class UdpSocket {
   let id: Int
   let requestedPort: UInt16
   let channel: FlutterMethodChannel
 
-  private var listener: NWListener?
-  private var sendConnection: NWConnection?
+  private var connection: NWConnection?
   private let queue = DispatchQueue(label: "native_udp", qos: .userInteractive)
-  private var localPort: UInt16 = 0
+  private var closed = false
 
   init(id: Int, port: UInt16, channel: FlutterMethodChannel) {
     self.id = id
@@ -89,69 +83,65 @@ private class UdpSocket {
     self.channel = channel
   }
 
-  func bind(completion: @escaping (Int?) -> Void) {
-    let params = NWParameters.udp
-    params.allowLocalEndpointReuse = true
-    // Require IPv4 to match mosh's behavior.
-    params.requiredInterfaceType = .other
-    if #available(iOS 14.0, *) {
-      params.prohibitConstrainedPaths = false
-    }
-
-    let port: NWEndpoint.Port
-    if requestedPort == 0 {
-      port = .any
-    } else {
-      port = NWEndpoint.Port(rawValue: requestedPort)!
-    }
-
-    do {
-      listener = try NWListener(using: params, on: port)
-    } catch {
-      completion(nil)
+  func send(data: Data, host: String, port: UInt16, completion: @escaping (Int) -> Void) {
+    if closed {
+      completion(0)
       return
     }
 
-    listener?.stateUpdateHandler = { [weak self] state in
-      switch state {
-      case .ready:
-        if let port = self?.listener?.port {
-          self?.localPort = port.rawValue
-          completion(Int(port.rawValue))
+    let endpoint = NWEndpoint.hostPort(
+      host: NWEndpoint.Host(host),
+      port: NWEndpoint.Port(rawValue: port)!
+    )
+
+    // Create connection lazily on first send.
+    if connection == nil {
+      let params = NWParameters.udp
+      params.allowLocalEndpointReuse = true
+      if #available(iOS 14.0, *) {
+        params.prohibitConstrainedPaths = false
+      }
+      // Bind to requested local port if specified.
+      if requestedPort != 0 {
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(
+          host: .ipv4(.any),
+          port: NWEndpoint.Port(rawValue: requestedPort)!
+        )
+      }
+
+      let conn = NWConnection(to: endpoint, using: params)
+      connection = conn
+
+      conn.stateUpdateHandler = { [weak self] state in
+        guard let self = self else { return }
+        switch state {
+        case .ready:
+          self.receiveLoop()
+        case .failed:
+          self.connection = nil
+        default:
+          break
         }
-      case .failed:
-        completion(nil)
-      default:
-        break
       }
+
+      conn.start(queue: queue)
     }
 
-    listener?.newConnectionHandler = { [weak self] connection in
-      self?.handleIncoming(connection)
-    }
-
-    listener?.start(queue: queue)
+    // Queue the send — NWConnection buffers until ready.
+    connection?.send(content: data, completion: .contentProcessed { error in
+      completion(error == nil ? data.count : 0)
+    })
   }
 
-  private func handleIncoming(_ connection: NWConnection) {
-    connection.stateUpdateHandler = { [weak self] state in
-      switch state {
-      case .ready:
-        self?.receiveLoop(connection)
-      default:
-        break
-      }
-    }
-    connection.start(queue: queue)
-  }
+  private func receiveLoop() {
+    guard let conn = connection, !closed else { return }
 
-  private func receiveLoop(_ connection: NWConnection) {
-    connection.receiveMessage { [weak self] data, _, _, error in
-      guard let self = self, let data = data, error == nil else { return }
+    conn.receiveMessage { [weak self] data, _, _, error in
+      guard let self = self, let data = data, error == nil, !self.closed else { return }
 
       var host = ""
       var port = 0
-      if case .hostPort(let h, let p) = connection.currentPath?.remoteEndpoint {
+      if case .hostPort(let h, let p) = conn.currentPath?.remoteEndpoint {
         switch h {
         case .ipv4(let addr):
           host = "\(addr)"
@@ -173,40 +163,13 @@ private class UdpSocket {
       }
 
       // Continue receiving.
-      self.receiveLoop(connection)
+      self.receiveLoop()
     }
-  }
-
-  func send(data: Data, host: String, port: UInt16, completion: @escaping (Int) -> Void) {
-    let endpoint = NWEndpoint.hostPort(
-      host: NWEndpoint.Host(host),
-      port: NWEndpoint.Port(rawValue: port)!
-    )
-
-    // Create or reuse connection for this destination.
-    if sendConnection == nil || sendConnection?.state == .cancelled {
-      let params = NWParameters.udp
-      params.allowLocalEndpointReuse = true
-      if requestedPort != 0 || localPort != 0 {
-        let bindPort = localPort != 0 ? localPort : requestedPort
-        params.requiredLocalEndpoint = NWEndpoint.hostPort(
-          host: .ipv4(.any),
-          port: NWEndpoint.Port(rawValue: bindPort)!
-        )
-      }
-      sendConnection = NWConnection(to: endpoint, using: params)
-      sendConnection?.start(queue: queue)
-    }
-
-    sendConnection?.send(content: data, completion: .contentProcessed { error in
-      completion(error == nil ? data.count : 0)
-    })
   }
 
   func close() {
-    listener?.cancel()
-    sendConnection?.cancel()
-    listener = nil
-    sendConnection = nil
+    closed = true
+    connection?.cancel()
+    connection = nil
   }
 }

@@ -13,6 +13,8 @@ import 'package:flutter/services.dart';
 class NativeUdpSocket {
   static const _channel = MethodChannel('native_udp');
   static int _nextId = 0;
+  static final _sockets = <int, NativeUdpSocket>{};
+  static bool _handlerRegistered = false;
 
   final int _id;
   final int localPort;
@@ -21,6 +23,28 @@ class NativeUdpSocket {
   bool _closed = false;
 
   NativeUdpSocket._(this._id, this.localPort);
+
+  static void _ensureHandler() {
+    if (_handlerRegistered) return;
+    _handlerRegistered = true;
+    _channel.setMethodCallHandler((call) async {
+      if (call.method == 'onDatagram') {
+        final args = call.arguments as Map;
+        final socketId = args['id'] as int;
+        final data = args['data'] as Uint8List;
+        final host = args['host'] as String;
+        final port = args['port'] as int;
+        final socket = _sockets[socketId];
+        if (socket != null && !socket._closed) {
+          socket._receiveController!.add(Datagram(
+            data,
+            InternetAddress(host),
+            port,
+          ));
+        }
+      }
+    });
+  }
 
   /// Bind a UDP socket to a local port (0 = ephemeral).
   /// On iOS, uses Network.framework. On Android, uses Dart's RawDatagramSocket.
@@ -44,6 +68,7 @@ class NativeUdpSocket {
     }
 
     // iOS: use native Network.framework.
+    _ensureHandler();
     final id = _nextId++;
     final result = await _channel.invokeMethod<Map>('bind', {
       'id': id,
@@ -52,24 +77,7 @@ class NativeUdpSocket {
     final localPort = result!['port'] as int;
     final wrapper = NativeUdpSocket._(id, localPort);
     wrapper._receiveController = StreamController<Datagram>.broadcast();
-
-    // Listen for incoming datagrams from native side.
-    _channel.setMethodCallHandler((call) async {
-      if (call.method == 'onDatagram') {
-        final args = call.arguments as Map;
-        final socketId = args['id'] as int;
-        final data = args['data'] as Uint8List;
-        final host = args['host'] as String;
-        final port = args['port'] as int;
-        if (socketId == wrapper._id && !wrapper._closed) {
-          wrapper._receiveController!.add(Datagram(
-            data,
-            InternetAddress(host),
-            port,
-          ));
-        }
-      }
-    });
+    _sockets[id] = wrapper;
 
     return wrapper;
   }
@@ -99,6 +107,7 @@ class NativeUdpSocket {
     if (_closed) return;
     _closed = true;
     _receiveController?.close();
+    _sockets.remove(_id);
 
     if (_dartSocket != null) {
       _dartSocket!.close();
